@@ -42,7 +42,7 @@ AI Party is that glue. It adds:
 ### Requirements
 
 - **Python 3.10+** on every machine
-- **llama.cpp binaries** — installed automatically by the setup script (downloaded from the official GitHub releases)
+- **llama.cpp binaries** — installed automatically by the setup script
 - A local network where all machines can reach the host, and the host can reach each worker
 
 You do **not** need Node.js, a C++ toolchain, or any prior llama.cpp install.
@@ -125,9 +125,7 @@ The window has fields for every flag `client.py` accepts:
 
 Click **Connect**. The GUI spawns `client.py` as a subprocess and streams its output into a live log pane on the right side of the window. A green status indicator appears once the worker is registered and heartbeating.
 
-Config is saved to `~/.aiparty_client_gui.json` on every change, so the fields are pre-filled next time you open it. There's also a **Detect** button for the local IP — it uses the standard UDP socket trick to find the primary non-loopback address.
-
-This is the intended path for anyone who isn't comfortable typing CLI flags. It runs on Windows, macOS, and Linux without any code changes.
+Config is saved to `~/.aiparty_client_gui.json` on every change, so the fields are pre-filled next time you open it. There's also a **Detect** button for the local IP.
 
 #### Option B — Command line
 
@@ -211,12 +209,6 @@ On Windows the subprocess is spawned with `CREATE_NO_WINDOW` so no console flash
 
 Every one of these flags is also exposed as a form field in the desktop GUI.
 
-### The `--node-ip` rule
-
-`--node-ip` is the address the **API host** uses to reach this worker. Not the address the worker uses to reach the host. If you're on Tailscale, use the worker's Tailscale IP. If you're on a LAN, use the worker's LAN IP.
-
-If a node appears in `/nodes` but never gets included in the tensor split, `--node-ip` is almost always the cause. The GUI's **Detect** button picks the right one in most cases.
-
 ### Advanced env vars
 
 | Variable | Default | Purpose |
@@ -225,36 +217,6 @@ If a node appears in `/nodes` but never gets included in the tensor split, `--no
 | `MIN_USABLE_GB_TO_PARTICIPATE` | `0.15` | Nodes below this are excluded from the split |
 | `RAM_SAFETY_RESERVE_GB` | `0.3` | Reserve subtracted from every node's available RAM |
 | `HEARTBEAT_TIMEOUT` | `10` | Evict a node after this many seconds without a heartbeat |
-
----
-
-## Troubleshooting
-
-### The frontend shows "can't reach cluster"
-
-Open the browser devtools → Network tab. The requests should be relative (`/api/models`, `/nodes`) resolved against the page's own origin. If you see an absolute IP like `192.168.1.6:8000`, the frontend build is stale. Rebuild with `API_BASE = ''` in the Next.js source and copy the new `out/` folder over `frontend/`.
-
-### A worker joins but doesn't appear in the split
-
-Almost always `--node-ip`. Check `/nodes` on the host:
-
-```bash
-curl http://localhost:8000/nodes | python3 -m json.tool
-```
-
-If the worker's `ip_address` says `127.0.0.1` but the worker isn't on the same machine, restart the worker with an explicit `--node-ip` (or use the GUI's **Detect** button).
-
-### Model load fails with exit code -6
-
-`-6` is `SIGABRT`. On multi-node loads, this is almost always an OOM on a worker, or a mismatch between the host and worker llama.cpp builds. Check that `llama-server --version` on the host and `ggml-rpc-server --help` on each worker report the same commit.
-
-### The desktop GUI says `_tkinter` module not found
-
-Your Python was built without Tk. On macOS with Homebrew Python: `brew install python-tk@3.12` (match your Python version). On Ubuntu: `sudo apt install python3-tk`. On Windows, reinstall Python from python.org and tick "tcl/tk and IDLE."
-
-### Frontend build fails with `Cannot find module '../server/require-hook'`
-
-You're on an odd-numbered Node version (25, 23, 21), which Next.js doesn't officially support. Install Node 20 or 22 LTS, then rebuild.
 
 ---
 
