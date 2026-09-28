@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-  AI Party — setup script for Windows.
+  AI Party - setup script for Windows.
 
 .DESCRIPTION
   Auto-detects architecture and NVIDIA GPU, then downloads the correct
   prebuilt llama.cpp binaries from GitHub.
 
   Installs the full dependency set. A machine can act as an API host,
-  a worker node, or both — the role is chosen at runtime.
+  a worker node, or both - the role is chosen at runtime.
 #>
 [CmdletBinding()]
 param()
@@ -63,7 +63,10 @@ if ($nvidiaSmi) {
   Say "No NVIDIA GPU detected; using CPU build."
 }
 
-Say "Detected: windows / $ArchTag $(if ($GpuTag) { "(GPU: $GpuTag)" } else { "" })"
+# Build the summary line without nested quotes
+$gpuSummary = ""
+if ($GpuTag) { $gpuSummary = " (GPU: $GpuTag)" }
+Say "Detected: windows / $ArchTag$gpuSummary"
 
 # ---------- Python ----------
 Say "Checking Python..."
@@ -85,18 +88,14 @@ foreach ($cand in @("python", "py")) {
   }
 }
 if (-not $py) {
-  Die @"
-Python 3.10+ not found. Install from https://www.python.org/downloads/
-Tick "Add python.exe to PATH" and "tcl/tk and IDLE" during setup.
-Then re-run this script.
-"@
+  Die "Python 3.10+ not found. Install from https://www.python.org/downloads/ and tick 'Add python.exe to PATH' and 'tcl/tk and IDLE' during setup. Then re-run this script."
 }
 Ok "Python $ver"
 
 # ---------- Fetch latest release tag (bNNNNN) ----------
 Say "Resolving latest llama.cpp release..."
 try {
-  $releases = Invoke-RestMethod -Uri "$GitHubApi?per_page=1" -UseBasicParsing
+  $releases = Invoke-RestMethod -Uri "$GitHubApi`?per_page=1" -UseBasicParsing
   $Tag = $releases[0].tag_name
 } catch {
   Die "Could not reach GitHub API: $_"
@@ -110,6 +109,7 @@ if ($GpuTag) {
   $runtimeAssetName = "cudart-llama-bin-win-${GpuTag}-${ArchTag}.zip"
 } else {
   $assetName = "llama-${Tag}-bin-win-cpu-${ArchTag}.zip"
+  $runtimeAssetName = ""
 }
 
 Say "Selected asset: $assetName"
@@ -139,7 +139,7 @@ if ($extracted) {
   Copy-Item -Path (Join-Path $tmpDir "*") -Destination $BinDir -Recurse -Force
 }
 
-if ($GpuTag) {
+if ($GpuTag -and $runtimeAssetName) {
   $runtimeUrl = "$GitHubDl/$Tag/$runtimeAssetName"
   $runtimeZip = Join-Path $tmpDir $runtimeAssetName
   Say "Checking for CUDA runtime DLLs..."
@@ -183,13 +183,15 @@ Ok "Dependencies installed"
 # ---------- Models ----------
 if (-not (Test-Path $ModelsDir)) {
   New-Item -ItemType Directory -Path $ModelsDir | Out-Null
-  @"
+  $modelsReadme = @"
 Drop your .gguf files in this folder.
+
 Recommended starters:
   - Qwen2.5-0.5B-Instruct Q4_K_M   (~350 MB)
   - Qwen2.5-1.5B-Instruct Q4_K_M   (~1 GB)
   - Llama-3.2-3B-Instruct Q4_K_M   (~2 GB)
-"@ | Out-File -Encoding utf8 (Join-Path $ModelsDir "README.txt")
+"@
+  $modelsReadme | Out-File -Encoding utf8 (Join-Path $ModelsDir "README.txt")
   Ok "Created $ModelsDir"
 }
 
@@ -209,7 +211,7 @@ Write-Host ""
 Write-Host "  Binaries : $BinDir"
 Write-Host "  Models   : $ModelsDir"
 Write-Host "  Venv     : $VenvDir"
-Write-Host "  Build    : windows/$ArchTag $(if ($GpuTag) { "($GpuTag)" })"
+Write-Host "  Build    : windows / $ArchTag$gpuSummary"
 Write-Host ""
 Write-Host "You can now run this machine as a host, a worker, or both."
 Write-Host ""
@@ -218,4 +220,18 @@ Write-Host "    .\scripts\run-host.ps1"
 Write-Host ""
 Write-Host "  Start as worker (joins another machine's cluster):"
 Write-Host "    .\scripts\run-worker.ps1 -ApiUrl http://<host-ip>:8000"
+Write-Host ""
+Write-Host "  Launch the desktop GUI client: (Once you have activated venv)"
+Write-Host "    python app.py"
+Write-Host ""
+Write-Host "To activate the virtual environment in this PowerShell window:" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "    .\.venv\Scripts\Activate.ps1" -ForegroundColor White
+Write-Host ""
+Write-Host "If PowerShell refuses to run it, allow scripts for this session first:" -ForegroundColor Cyan
+Write-Host ""
+Write-Host "    Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass" -ForegroundColor White
+Write-Host ""
+Write-Host "Once activated, your prompt shows '(.venv)' and 'python' resolves" -ForegroundColor Cyan
+Write-Host "to the venv interpreter. Run 'deactivate' to leave it." -ForegroundColor Cyan
 Write-Host ""
