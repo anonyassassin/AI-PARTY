@@ -5,13 +5,16 @@
 # Auto-detects OS, CPU architecture, and NVIDIA GPU/CUDA support, then
 # downloads the correct prebuilt llama.cpp binaries from GitHub.
 #
+# Installs the full dependency set. A machine can act as an API host,
+# a worker node, or both — the role is chosen at runtime.
+#
 set -euo pipefail
 
 # ---------- config ----------
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="${REPO_ROOT}/bin"
 MODELS_DIR="${REPO_ROOT}/models"
-VENV_DIR="${REPO_ROOT}/.venv"
+VENV_DIR="${REPO_ROOT}/myvenv"
 
 LLAMA_REPO="ggml-org/llama.cpp"
 GITHUB_API="https://api.github.com/repos/${LLAMA_REPO}/releases"
@@ -31,27 +34,6 @@ die() {
   printf '%s\n' "${c_red}✗${c_reset} $*" >&2
   exit 1
 }
-
-# ---------- argument parsing ----------
-MODE="host"
-
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-  --worker)
-    MODE="worker"
-    shift
-    ;;
-  --host)
-    MODE="host"
-    shift
-    ;;
-  -h | --help)
-    sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
-    exit 0
-    ;;
-  *) die "Unknown argument: $1" ;;
-  esac
-done
 
 # ---------- OS and architecture detection ----------
 OS="$(uname -s)"
@@ -111,7 +93,7 @@ fi
 ok "Python $PY_VER at $(command -v $PY)"
 
 # ---------- Fetch latest release tag (bNNNNN) ----------
-# Note: /releases/latest returns the most recent *stable* release (vX.Y.Z),
+# /releases/latest returns the most recent *stable* release (vX.Y.Z),
 # which may not include the newest binaries. /releases?per_page=1 returns
 # the newest entry regardless of pre-release status, which is what we want
 # since llama.cpp ships rolling bNNNNN builds.
@@ -120,7 +102,6 @@ RELEASE_JSON=$(curl -sL "${GITHUB_API}?per_page=1")
 TAG=$(echo "$RELEASE_JSON" | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
 
 if [[ -z "$TAG" ]]; then
-  # Fallback in case the API shape changes
   TAG=$(curl -sL "${GITHUB_API}/latest" | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
 fi
 
@@ -128,14 +109,9 @@ fi
 ok "Latest release: $TAG"
 
 # ---------- Build asset name ----------
-# Examples:
-#   macOS arm64:  llama-b10809-bin-macos-arm64.tar.gz
-#   Ubuntu x64:   llama-b10809-bin-ubuntu-x64.tar.gz
-#   Windows x64:  llama-b10809-bin-win-cpu-x64.zip
 if [[ "$PLATFORM" == "macos" ]]; then
   ASSET="llama-${TAG}-bin-macos-${ARCH_TAG}.tar.gz"
 elif [[ "$GPU_TAG" == cuda-* && "$ARCH_TAG" == "x64" ]]; then
-  # Official CUDA Linux builds are x64 only.
   ASSET="llama-${TAG}-bin-ubuntu-${GPU_TAG}-${ARCH_TAG}.tar.gz"
 else
   ASSET="llama-${TAG}-bin-ubuntu-${ARCH_TAG}.tar.gz"
@@ -178,11 +154,10 @@ ok "Binaries present"
 # ---------- Python deps ----------
 say "Installing Python dependencies…"
 REQ_FILE="${REPO_ROOT}/requirements.txt"
-[[ "$MODE" == "worker" ]] && REQ_FILE="${REPO_ROOT}/requirements-worker.txt"
 [[ -f "$REQ_FILE" ]] || die "Missing $REQ_FILE"
 
 if [[ ! -d "$VENV_DIR" ]]; then
-  say "Creating virtual environment…"
+  say "Creating virtual environment at ${VENV_DIR}"
   "$PY" -m venv "$VENV_DIR"
 fi
 source "${VENV_DIR}/bin/activate"
@@ -191,7 +166,7 @@ pip install -r "$REQ_FILE"
 ok "Dependencies installed"
 
 # ---------- Models directory ----------
-if [[ "$MODE" == "host" && ! -d "$MODELS_DIR" ]]; then
+if [[ ! -d "$MODELS_DIR" ]]; then
   mkdir -p "$MODELS_DIR"
   cat >"$MODELS_DIR/README.txt" <<'EOF'
 Drop your .gguf files in this folder.
@@ -201,6 +176,14 @@ Recommended starters:
   - Llama-3.2-3B-Instruct Q4_K_M   (~2 GB)
 EOF
   ok "Created ${MODELS_DIR}"
+fi
+
+# ---------- Frontend check ----------
+if [[ -d "${REPO_ROOT}/frontend" && -f "${REPO_ROOT}/frontend/index.html" ]]; then
+  ok "Frontend present at ${REPO_ROOT}/frontend"
+else
+  warn "No prebuilt frontend at ${REPO_ROOT}/frontend."
+  warn "The API will run, but the chat UI won't be served."
 fi
 
 # ---------- Summary ----------
@@ -213,19 +196,12 @@ ${c_green}${c_bold}Setup complete.${c_reset}
   Venv     : ${VENV_DIR}
   Build    : ${PLATFORM}/${ARCH_TAG}${GPU_TAG:+ (${GPU_TAG})}
 
-$(
-  [[ "$MODE" == "host" ]] && cat <<'INNER'
-Next steps (host):
-  1. Add a .gguf file to ./models/
-  2. Start: ./scripts/run-host.sh
-INNER
-)
+You can now run this machine as a host, a worker, or both.
 
-$(
-  [[ "$MODE" == "worker" ]] && cat <<'INNER'
-Next steps (worker):
-  ./scripts/run-worker.sh --api-url http://<host>:8000
-INNER
-)
+  Start as host (serves the API + chat UI):
+    ./scripts/run-host.sh
+
+  Start as worker (joins another machine's cluster):
+    ./scripts/run-worker.sh --api-url http://<host-ip>:8000
 
 EOF

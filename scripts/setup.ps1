@@ -1,16 +1,16 @@
 <#
 .SYNOPSIS
   AI Party — setup script for Windows.
+
 .DESCRIPTION
   Auto-detects architecture and NVIDIA GPU, then downloads the correct
   prebuilt llama.cpp binaries from GitHub.
-.PARAMETER Worker
-  Install only worker-node dependencies.
+
+  Installs the full dependency set. A machine can act as an API host,
+  a worker node, or both — the role is chosen at runtime.
 #>
 [CmdletBinding()]
-param(
-  [switch]$Worker
-)
+param()
 
 $ErrorActionPreference = "Stop"
 
@@ -18,13 +18,11 @@ $ErrorActionPreference = "Stop"
 $RepoRoot  = Split-Path -Parent $PSScriptRoot
 $BinDir    = Join-Path $RepoRoot "bin"
 $ModelsDir = Join-Path $RepoRoot "models"
-$VenvDir   = Join-Path $RepoRoot ".venv"
+$VenvDir   = Join-Path $RepoRoot "myvenv"
 
 $LlamaRepo = "ggml-org/llama.cpp"
 $GitHubApi = "https://api.github.com/repos/$LlamaRepo/releases"
 $GitHubDl  = "https://github.com/$LlamaRepo/releases/download"
-
-$Mode = if ($Worker) { "worker" } else { "host" }
 
 # ---------- pretty output ----------
 function Say  ($msg) { Write-Host "▸ $msg" -ForegroundColor Yellow }
@@ -89,8 +87,6 @@ Tick "Add python.exe to PATH" during setup.
 Ok "Python $ver"
 
 # ---------- Fetch latest release tag (bNNNNN) ----------
-# /releases/latest returns stable vX.Y.Z; /releases?per_page=1 returns the
-# newest build including rolling bNNNNN pre-releases, which is what we want.
 Say "Resolving latest llama.cpp release…"
 try {
   $releases = Invoke-RestMethod -Uri "$GitHubApi?per_page=1" -UseBasicParsing
@@ -102,10 +98,6 @@ if (-not $Tag) { Die "Could not resolve latest release tag." }
 Ok "Latest release: $Tag"
 
 # ---------- Select asset ----------
-# Windows naming:
-#   CPU:  llama-<TAG>-bin-win-cpu-<ARCH>.zip
-#   CUDA: llama-<TAG>-bin-win-cuda-12.4-<ARCH>.zip
-#         llama-<TAG>-bin-win-cuda-12.8-<ARCH>.zip
 if ($GpuTag) {
   $assetName = "llama-${Tag}-bin-win-${GpuTag}-${ArchTag}.zip"
   $runtimeAssetName = "cudart-llama-bin-win-${GpuTag}-${ArchTag}.zip"
@@ -133,7 +125,6 @@ Say "Extracting into $BinDir …"
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
 
-# Flatten any versioned subdirectory
 $extracted = Get-ChildItem -Path $tmpDir -Directory | Where-Object { $_.Name -like "llama-*" } | Select-Object -First 1
 if ($extracted) {
   Copy-Item -Path (Join-Path $extracted.FullName "*") -Destination $BinDir -Recurse -Force
@@ -141,7 +132,6 @@ if ($extracted) {
   Copy-Item -Path (Join-Path $tmpDir "*") -Destination $BinDir -Recurse -Force
 }
 
-# Optional CUDA runtime DLLs (for users without CUDA Toolkit installed)
 if ($GpuTag) {
   $runtimeUrl = "$GitHubDl/$Tag/$runtimeAssetName"
   $runtimeZip = Join-Path $tmpDir $runtimeAssetName
@@ -171,12 +161,11 @@ if (Test-Path $rpcExe) {
 
 # ---------- Python deps ----------
 Say "Installing Python dependencies…"
-$reqFile = if ($Worker) { "requirements-worker.txt" } else { "requirements.txt" }
-$reqPath = Join-Path $RepoRoot $reqFile
+$reqPath = Join-Path $RepoRoot "requirements.txt"
 if (-not (Test-Path $reqPath)) { Die "Missing $reqPath" }
 
 if (-not (Test-Path $VenvDir)) {
-  Say "Creating virtual environment…"
+  Say "Creating virtual environment at $VenvDir"
   & $py -m venv $VenvDir
 }
 $venvPy = Join-Path $VenvDir "Scripts\python.exe"
@@ -185,7 +174,7 @@ $venvPy = Join-Path $VenvDir "Scripts\python.exe"
 Ok "Dependencies installed"
 
 # ---------- Models ----------
-if ($Mode -eq "host" -and -not (Test-Path $ModelsDir)) {
+if (-not (Test-Path $ModelsDir)) {
   New-Item -ItemType Directory -Path $ModelsDir | Out-Null
   @"
 Drop your .gguf files in this folder.
@@ -197,6 +186,16 @@ Recommended starters:
   Ok "Created $ModelsDir"
 }
 
+# ---------- Frontend check ----------
+$frontendIndex = Join-Path $RepoRoot "frontend\index.html"
+if (Test-Path $frontendIndex) {
+  Ok "Frontend present at $RepoRoot\frontend"
+} else {
+  Warn "No prebuilt frontend at $RepoRoot\frontend."
+  Warn "The API will run, but the chat UI won't be served."
+}
+
+# ---------- Summary ----------
 Write-Host ""
 Write-Host "Setup complete." -ForegroundColor Green
 Write-Host ""
@@ -205,12 +204,11 @@ Write-Host "  Models   : $ModelsDir"
 Write-Host "  Venv     : $VenvDir"
 Write-Host "  Build    : windows/$ArchTag $(if ($GpuTag) { "($GpuTag)" })"
 Write-Host ""
-
-if ($Mode -eq "host") {
-  Write-Host "Next steps (host):"
-  Write-Host "  1. Add a .gguf file to $ModelsDir"
-  Write-Host "  2. Start: .\scripts\run-host.ps1"
-} else {
-  Write-Host "Next steps (worker):"
-  Write-Host "  .\scripts\run-worker.ps1 -ApiUrl http://<host>:8000"
-}
+Write-Host "You can now run this machine as a host, a worker, or both."
+Write-Host ""
+Write-Host "  Start as host (serves the API + chat UI):"
+Write-Host "    .\scripts\run-host.ps1"
+Write-Host ""
+Write-Host "  Start as worker (joins another machine's cluster):"
+Write-Host "    .\scripts\run-worker.ps1 -ApiUrl http://<host-ip>:8000"
+Write-Host ""
