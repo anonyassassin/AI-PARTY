@@ -34,7 +34,7 @@ def resolve_llama_bin(bin_name: str, custom_dir: Optional[str] = None) -> str:
         os.path.join(project_root, "llama.cpp", "build", "bin"),
         os.path.join(project_root, "llama.cpp", "build", "bin", "Release"),
         os.path.join(project_root, "bin"),
-        os.path.join(project_root, "llama.cpp")
+        os.path.join(project_root, "llama.cpp"),
     ]
 
     for path in search_paths:
@@ -52,11 +52,7 @@ def get_models_dir(custom_model_dir: Optional[str] = None) -> str:
       2. MODEL_DIR env var
       3. ./models next to server.py
       4. ./models next to the current working directory
-      5. ../models relative to server.py (useful when server.py lives in a subfolder)
-
-    The first existing directory wins. If none exist, returns the
-    server.py-adjacent ./models path so callers get a consistent value
-    (and discover_models will return an empty list).
+      5. ../models relative to server.py
     """
     candidates = []
     if custom_model_dir:
@@ -111,6 +107,11 @@ LAST_MODEL_FILE = os.getenv(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "last_model.json"),
 )
 
+# When set to 1/true/yes, cold start resumes the persisted last-running
+# model instead of falling back to the smallest model on disk. Default is
+# off so a bad manual selection doesn't persist across restarts.
+RESUME_LAST_MODEL = os.getenv("RESUME_LAST_MODEL", "0").strip().lower() in ("1", "true", "yes")
+
 _LAUNCH_LOCK = threading.RLock()
 _STATE_LOCK = threading.Lock()
 _LOAD_GENERATION = 0
@@ -124,7 +125,7 @@ LOAD_STATE: Dict[str, Any] = {
     "model": None,
     "model_name": None,
     "size_gb": 0.0,
-    "phase": None,          # starting | loading | finalizing
+    "phase": None,          # starting | uploading | loading | finalizing
     "progress_pct": None,
     "loaded_gb": None,
     "remote_nodes": 0,
@@ -132,6 +133,9 @@ LOAD_STATE: Dict[str, Any] = {
     "net_sent_gb": 0.0,
     "net_rate_mbps": None,
     "eta_s": None,
+    "workers": [],
+    "bottleneck_worker": None,
+    "progress_source": None,
     "started_at": None,
     "ready_at": None,
     "last_error": None,
@@ -155,7 +159,6 @@ _VERIFIED_MODELS: Dict[str, float] = _load_verified()
 
 
 def is_model_verified(model: Dict[str, Any]) -> bool:
-    """True if this exact file (same name and size) has loaded successfully before."""
     with _STATE_LOCK:
         size = _VERIFIED_MODELS.get(model["filename"])
     return size is not None and abs(size - float(model["size_gb"])) < 0.01
@@ -203,11 +206,20 @@ def _persist_last_model(filename: str) -> None:
         print(f"[SERVER] Couldn't persist last model to {LAST_MODEL_FILE}: {e}")
 
 
+def _clear_last_model() -> None:
+    try:
+        if os.path.exists(LAST_MODEL_FILE):
+            os.remove(LAST_MODEL_FILE)
+    except Exception as e:
+        print(f"[SERVER] Couldn't remove {LAST_MODEL_FILE}: {e}")
+
+
 def get_load_status() -> Dict[str, Any]:
     with _STATE_LOCK:
         status = dict(LOAD_STATE)
         if status["last_error"]:
             status["last_error"] = dict(status["last_error"])
+        status["workers"] = [dict(w) for w in status.get("workers", [])]
     if status["started_at"]:
         end = status["ready_at"] if status["state"] != "loading" and status["ready_at"] else time.time()
         status["elapsed_s"] = round(max(end - status["started_at"], 0.0), 1)
@@ -222,7 +234,6 @@ def is_loading() -> bool:
 
 
 def _begin_load_locked(model: Dict[str, Any], reason: str, message: Optional[str]) -> int:
-    """Caller must hold _STATE_LOCK. Resets LOAD_STATE for a new load and returns its generation."""
     global _LOAD_GENERATION, CURRENT_MODEL_FILENAME
     _LOAD_GENERATION += 1
     CURRENT_MODEL_FILENAME = model["filename"]
@@ -241,6 +252,9 @@ def _begin_load_locked(model: Dict[str, Any], reason: str, message: Optional[str
         "net_sent_gb": 0.0,
         "net_rate_mbps": None,
         "eta_s": None,
+        "workers": [],
+        "bottleneck_worker": None,
+        "progress_source": None,
         "started_at": time.time(),
         "ready_at": None,
     })
@@ -248,10 +262,6 @@ def _begin_load_locked(model: Dict[str, Any], reason: str, message: Optional[str
 
 
 def begin_manual_switch(model: Dict[str, Any]) -> Optional[int]:
-    """
-    Atomically claims the loader for a user-requested switch. Returns the
-    load generation, or None if another load is already in progress.
-    """
     with _STATE_LOCK:
         if LOAD_STATE["state"] == "loading":
             return None
@@ -260,11 +270,6 @@ def begin_manual_switch(model: Dict[str, Any]) -> Optional[int]:
 
 
 def begin_topology_reload(model: Dict[str, Any], message: Optional[str] = None) -> Optional[int]:
-    """
-    Claims the loader for a topology-triggered restart. Returns None if a
-    manual switch is already loading — the in-flight switch will relaunch
-    against the new topology on its own, so we don't want to clobber it.
-    """
     with _STATE_LOCK:
         if LOAD_STATE["state"] == "loading" and LOAD_STATE["reason"] == "switch":
             return None
@@ -350,7 +355,8 @@ def _fail_load(gen: int, message: str, allow_revert: bool = True) -> None:
 # llama-server output parsing / load progress
 # ------------------------------------------------------------------
 _DOTS_RE = re.compile(r"^\.+$")
-_BUFFER_RE = re.compile(r"(\S+)\s+model buffer size\s*=\s*([\d.]+)\s*MiB")
+_RPC_BUFFER_RE = re.compile(r"RPC\[([^\]]+)\]\s+model buffer size\s*=\s*([\d.]+)\s*MiB")
+_RPC_TENSOR_RE = re.compile(r"RPC\[([^\]]+)\][^\n]*?([\d.]+)\s*MiB")
 _ERROR_HINT_RE = re.compile(r"error|failed|unable|cannot|abort|exception", re.IGNORECASE)
 _OOM_RE = re.compile(r"out of memory|failed to allocate|cannot allocate|bad_alloc|OOM", re.IGNORECASE)
 
@@ -359,8 +365,12 @@ class _LoadMonitor:
     def __init__(self):
         self.dots = 0
         self.dots_done = False
-        self.rpc_buffer_bytes = 0.0
+        self.rpc_bytes_by_endpoint: Dict[str, float] = {}
+        self.rpc_buffer_bytes_unattributed = 0.0
         self.tail = collections.deque(maxlen=40)
+
+    def total_rpc_bytes(self) -> float:
+        return sum(self.rpc_bytes_by_endpoint.values()) + self.rpc_buffer_bytes_unattributed
 
 
 def _handle_line(line: str, monitor: _LoadMonitor, complete: bool) -> None:
@@ -372,12 +382,34 @@ def _handle_line(line: str, monitor: _LoadMonitor, complete: bool) -> None:
         return
     if not complete:
         return
-    m = _BUFFER_RE.search(stripped)
-    if m and m.group(1).upper().startswith("RPC"):
+
+    m = _RPC_BUFFER_RE.search(stripped)
+    if m:
+        endpoint = m.group(1).strip()
         try:
-            monitor.rpc_buffer_bytes += float(m.group(2)) * 1024 * 1024
+            b = float(m.group(2)) * 1024 * 1024
+            monitor.rpc_bytes_by_endpoint[endpoint] = monitor.rpc_bytes_by_endpoint.get(endpoint, 0.0) + b
         except ValueError:
             pass
+        return
+
+    m = _RPC_TENSOR_RE.search(stripped)
+    if m:
+        endpoint = m.group(1).strip()
+        try:
+            b = float(m.group(2)) * 1024 * 1024
+            monitor.rpc_bytes_by_endpoint[endpoint] = monitor.rpc_bytes_by_endpoint.get(endpoint, 0.0) + b
+        except ValueError:
+            pass
+        return
+
+    if stripped.upper().startswith("RPC") and "MiB" in stripped:
+        m2 = re.search(r"([\d.]+)\s*MiB", stripped)
+        if m2:
+            try:
+                monitor.rpc_buffer_bytes_unattributed += float(m2.group(1)) * 1024 * 1024
+            except ValueError:
+                pass
 
 
 def _log_reader(proc: subprocess.Popen, monitor: _LoadMonitor) -> None:
@@ -431,14 +463,48 @@ def _failure_message(name: str, returncode: Optional[int], monitor: _LoadMonitor
     return msg
 
 
+RATE_WARMUP_S = float(os.getenv("LOAD_ETA_WARMUP_S", "6"))
+RATE_MIN_SAMPLES = int(os.getenv("LOAD_ETA_MIN_SAMPLES", "10"))
+
+
+class _RateTracker:
+    def __init__(self, alpha: float = 0.3):
+        self.alpha = alpha
+        self.rate: Optional[float] = None
+        self.samples = 0
+        self._last_t: Optional[float] = None
+        self._last_v: float = 0.0
+
+    def update(self, value: float, now: float) -> None:
+        if self._last_t is None:
+            self._last_t, self._last_v = now, value
+            return
+        dt = now - self._last_t
+        if dt <= 0:
+            return
+        inst = max(value - self._last_v, 0.0) / dt
+        self.rate = inst if self.rate is None else (self.alpha * inst + (1 - self.alpha) * self.rate)
+        self._last_t, self._last_v = now, value
+        self.samples += 1
+
+    def stable(self) -> Optional[float]:
+        if self.samples < RATE_MIN_SAMPLES or self.rate is None or self.rate <= 0:
+            return None
+        return self.rate
+
+
 def _watch_load(proc: subprocess.Popen, gen: int, monitor: _LoadMonitor,
-                model: Dict[str, Any], remote_estimate_bytes: float, remote_nodes: int) -> None:
+                model: Dict[str, Any], planned_targets: Dict[str, Dict[str, Any]],
+                remote_nodes: int, started_at: float) -> None:
     health_url = f"http://127.0.0.1:{LLAMA_SERVER_PORT}/health"
-    total_bytes = float(model["size_gb"]) * (1024 ** 3)
     net_start = _net_bytes_sent()
-    last_sample_t, last_sample_sent = time.time(), 0
-    rate_ema: Optional[float] = None
-    first_pct_point: Optional[tuple] = None
+    total_bytes = float(model["size_gb"]) * (1024 ** 3)
+
+    agg_rate = _RateTracker(alpha=0.3)
+
+    first_dots_point: Optional[tuple] = None
+    first_byte_t: Optional[float] = None
+
     last_progress_t = time.time()
     last_progress_mark = (0, 0)
 
@@ -451,9 +517,6 @@ def _watch_load(proc: subprocess.Popen, gen: int, monitor: _LoadMonitor,
 
             rc = proc.poll()
             if rc is not None:
-                # Give the reader thread a moment to drain the final output
-                # before we inspect the tail. Some aborts flush the reason
-                # in the last few hundred ms.
                 time.sleep(0.5)
                 tail = list(monitor.tail)
                 if tail:
@@ -463,50 +526,108 @@ def _watch_load(proc: subprocess.Popen, gen: int, monitor: _LoadMonitor,
                     print("[SERVER] --- end of tail ---")
                 else:
                     print("[SERVER] llama-server exited with no captured output. "
-                          "This usually means an env/cwd/binary problem, not a model problem. "
-                          "Check the Spawn env line above against your working shell.")
+                          "This usually means an env/cwd/binary problem, not a model problem.")
                 _fail_load(gen, _failure_message(model["name"], rc, monitor))
                 return
 
             try:
                 if client.get(health_url).status_code == 200:
+                    with _STATE_LOCK:
+                        for w in LOAD_STATE.get("workers", []):
+                            w["sent_gb"] = w["target_gb"]
+                            w["pct"] = 100.0
+                            w["eta_s"] = 0
+                            w["done"] = True
                     _mark_ready(gen)
                     return
             except httpx.HTTPError:
                 pass
 
             now = time.time()
-            sent = max(_net_bytes_sent() - net_start, 0)
-            dt = now - last_sample_t
-            if dt > 0:
-                inst = (sent - last_sample_sent) / dt
-                rate_ema = inst if rate_ema is None else 0.3 * inst + 0.7 * rate_ema
-            last_sample_t, last_sample_sent = now, sent
 
-            remote_bytes = monitor.rpc_buffer_bytes or remote_estimate_bytes
-            if monitor.dots_done:
-                pct: Optional[float] = 100.0
-            elif remote_bytes > 0 and sent > 0:
-                pct = min(99.0, max(sent / remote_bytes * 100.0, float(monitor.dots)))
-            elif monitor.dots > 0:
-                pct = float(min(monitor.dots, 99))
+            net_sent = max(_net_bytes_sent() - net_start, 0)
+            agg_rate.update(float(net_sent), now)
+            agg_rate_val = agg_rate.stable()
+
+            if net_sent > 0 and first_byte_t is None:
+                first_byte_t = now
+
+            real_by_endpoint = monitor.rpc_bytes_by_endpoint
+            workers_snapshot: List[Dict[str, Any]] = []
+
+            if real_by_endpoint:
+                endpoints = list(real_by_endpoint.keys())
+                total_planned_bytes = sum(real_by_endpoint.values())
+                progress_source = "rpc_buffers"
+            else:
+                endpoints = list(planned_targets.keys())
+                total_planned_bytes = sum(
+                    t["planned_gb"] * (1024 ** 3) for t in planned_targets.values()
+                ) if planned_targets else 0.0
+                progress_source = "network" if total_planned_bytes > 0 else None
+
+            if total_planned_bytes > 0 and endpoints:
+                sent_bytes = min(net_sent, total_planned_bytes)
+                for ep in endpoints:
+                    if real_by_endpoint:
+                        target_bytes = real_by_endpoint[ep]
+                    else:
+                        target_bytes = planned_targets[ep]["planned_gb"] * (1024 ** 3)
+                    fraction = target_bytes / total_planned_bytes if total_planned_bytes > 0 else 0.0
+                    worker_sent = sent_bytes * fraction
+                    worker_pct = min(99.0, (worker_sent / target_bytes * 100.0)) if target_bytes > 0 else 0.0
+
+                    worker_eta = None
+                    if agg_rate_val and target_bytes > 0:
+                        remaining = max(target_bytes - worker_sent, 0.0)
+                        worker_eta = remaining / agg_rate_val
+
+                    info = planned_targets.get(ep, {})
+                    workers_snapshot.append({
+                        "endpoint": ep,
+                        "hostname": info.get("hostname", ep),
+                        "target_gb": round(target_bytes / (1024 ** 3), 2),
+                        "sent_gb": round(worker_sent / (1024 ** 3), 2),
+                        "pct": round(worker_pct, 1),
+                        "eta_s": round(worker_eta) if worker_eta is not None else None,
+                        "done": False,
+                    })
+
+            if monitor.dots > 0:
+                progress_source = "dots"
+                if first_dots_point is None:
+                    first_dots_point = (now, monitor.dots)
+                if monitor.dots_done:
+                    pct: Optional[float] = 100.0
+                else:
+                    pct = float(min(monitor.dots, 99))
+            elif total_planned_bytes > 0 and net_sent > 0:
+                pct = min(99.0, net_sent / total_planned_bytes * 100.0)
             else:
                 pct = None
 
-            if pct is not None and pct > 0 and first_pct_point is None:
-                first_pct_point = (now, pct)
-
             eta: Optional[float] = None
-            if pct is not None and pct >= 100:
-                eta = None
-            elif remote_bytes > 0 and rate_ema and rate_ema > 1024:
-                eta = max(remote_bytes - sent, 0) / rate_ema
-            elif first_pct_point and pct is not None and pct - first_pct_point[1] >= 1:
-                eta = (100 - pct) * (now - first_pct_point[0]) / (pct - first_pct_point[1])
 
-            phase = "finalizing" if monitor.dots_done else ("loading" if pct is not None else "starting")
+            if (monitor.dots > 0 and not monitor.dots_done
+                    and first_dots_point is not None
+                    and now - first_dots_point[0] >= RATE_WARMUP_S):
+                dt = now - first_dots_point[0]
+                dp = monitor.dots - first_dots_point[1]
+                if dp >= 2 and dt > 0:
+                    eta = (100 - monitor.dots) * dt / dp
 
-            mark = (monitor.dots, sent // (256 * 1024))
+            if eta is None and agg_rate_val and total_planned_bytes > 0 and first_byte_t is not None:
+                if now - first_byte_t >= RATE_WARMUP_S:
+                    remaining = max(total_planned_bytes - net_sent, 0.0)
+                    eta = remaining / agg_rate_val
+
+            bottleneck = None
+            if workers_snapshot:
+                incomplete = [w for w in workers_snapshot if not w["done"]]
+                if incomplete:
+                    bottleneck = max(incomplete, key=lambda w: w["target_gb"] - w["sent_gb"])["endpoint"]
+
+            mark = (monitor.dots, net_sent // (256 * 1024))
             if mark != last_progress_mark:
                 last_progress_mark = mark
                 last_progress_t = now
@@ -517,16 +638,28 @@ def _watch_load(proc: subprocess.Popen, gen: int, monitor: _LoadMonitor,
                                 f"{LOAD_STALL_TIMEOUT_S:.0f}s). Check the worker nodes and network.")
                 return
 
+            if monitor.dots_done:
+                phase = "finalizing"
+            elif monitor.dots > 0:
+                phase = "loading"
+            elif net_sent > 0:
+                phase = "uploading"
+            else:
+                phase = "starting"
+
             if not _update_load(
                 gen,
                 phase=phase,
                 progress_pct=round(pct, 1) if pct is not None else None,
                 loaded_gb=round(total_bytes * pct / 100 / (1024 ** 3), 2) if pct is not None else None,
                 remote_nodes=remote_nodes,
-                network_gb=round(remote_bytes / (1024 ** 3), 2),
-                net_sent_gb=round(min(sent, remote_bytes) / (1024 ** 3), 2) if remote_bytes > 0 else 0.0,
-                net_rate_mbps=round(rate_ema / (1024 ** 2), 1) if rate_ema is not None and remote_bytes > 0 else None,
+                network_gb=round(total_planned_bytes / (1024 ** 3), 2) if total_planned_bytes > 0 else 0.0,
+                net_sent_gb=round(min(net_sent, total_planned_bytes) / (1024 ** 3), 2) if total_planned_bytes > 0 else 0.0,
+                net_rate_mbps=round(agg_rate_val / (1024 ** 2), 1) if agg_rate_val else None,
                 eta_s=round(eta) if eta is not None else None,
+                workers=workers_snapshot,
+                bottleneck_worker=bottleneck,
+                progress_source=progress_source,
             ):
                 return
 
@@ -642,12 +775,13 @@ def resolve_startup_model(model_dir: Optional[str], requested: Optional[str] = N
     """
     Startup / topology-reload model selection:
       1. Explicit `requested` filename, if it exists on disk.
-      2. Persisted last running model, if it still exists on disk.
+      2. Persisted last running model, if RESUME_LAST_MODEL is enabled and
+         it still exists on disk.
       3. Smallest model on disk.
 
-    This is what makes cold start resume the previously-running model when
-    one is on record, and fall back to the smallest model otherwise — no
-    matter how much RAM or how many nodes happen to be available.
+    RESUME_LAST_MODEL defaults to off so a bad manual selection (e.g. a
+    7B that's too slow for the current cluster) doesn't persist across
+    restarts. Set RESUME_LAST_MODEL=1 in the environment to opt back in.
     """
     models = discover_models(model_dir)
     if not models:
@@ -657,13 +791,14 @@ def resolve_startup_model(model_dir: Optional[str], requested: Optional[str] = N
     if requested and requested in by_name:
         return by_name[requested]
 
-    last = get_last_model()
-    if last and last in by_name:
-        print(f"[SERVER] Resuming last running model '{by_name[last]['name']}'.")
-        return by_name[last]
+    if RESUME_LAST_MODEL:
+        last = get_last_model()
+        if last and last in by_name:
+            print(f"[SERVER] RESUME_LAST_MODEL is on — resuming '{by_name[last]['name']}'.")
+            return by_name[last]
 
     smallest = min(models, key=lambda m: m["size_gb"])
-    print(f"[SERVER] No last model on record — starting with smallest available: '{smallest['name']}'.")
+    print(f"[SERVER] Cold start: choosing smallest available model '{smallest['name']}'.")
     return smallest
 
 
@@ -674,13 +809,14 @@ def calculate_tensor_split(active_nodes: dict) -> Dict[str, Any]:
     excluded_nodes = [n for n in capacity["nodes"] if not n["is_host"] and n["excluded"]]
 
     weights = [max(host_node["usable_ram_gb"], 0.1)]
-    rpc_endpoints = []
+    endpoints = []
 
     for n in worker_nodes:
         info = active_nodes.get(n["id"])
         if not info:
             continue
-        rpc_endpoints.append(f"{info['ip_address']}:{info['port']}")
+        ep = f"{info['ip_address']}:{info['port']}"
+        endpoints.append((ep, n["id"], n["hostname"]))
         weights.append(max(n["usable_ram_gb"], 0.1))
 
     total_weight = sum(weights)
@@ -691,10 +827,35 @@ def calculate_tensor_split(active_nodes: dict) -> Dict[str, Any]:
 
     return {
         "tensor_split": ",".join(str(v) for v in split_values),
-        "rpc_string": ",".join(rpc_endpoints),
+        "tensor_split_values": split_values,
+        "rpc_string": ",".join(ep for ep, _, _ in endpoints),
         "total_usable_gb": capacity["total_usable_gb"],
         "excluded_nodes": excluded_nodes,
+        "workers": [(ep, hostname, w) for (ep, _, hostname), w in zip(endpoints, weights[1:])],
+        "host_weight": weights[0],
     }
+
+
+def _build_planned_targets(split_info: Dict[str, Any], model_size_gb: float) -> Dict[str, Dict[str, Any]]:
+    workers = split_info.get("workers", [])
+    split_values = split_info.get("tensor_split_values", [])
+    if not workers or not split_values or len(split_values) < 2:
+        return {}
+
+    total_weight = sum(split_values)
+    if total_weight <= 0:
+        return {}
+
+    model_bytes = model_size_gb * (1024 ** 3)
+    planned: Dict[str, Dict[str, Any]] = {}
+    for (ep, hostname, weight), split_val in zip(workers, split_values[1:]):
+        share = split_val / total_weight
+        planned[ep] = {
+            "hostname": hostname,
+            "weight": weight,
+            "planned_gb": round(model_bytes * share / (1024 ** 3), 3),
+        }
+    return planned
 
 
 def get_current_launch_info() -> Dict[str, Any]:
@@ -707,11 +868,6 @@ def get_current_launch_info() -> Dict[str, Any]:
 
 
 def _build_subprocess_env() -> Dict[str, str]:
-    """
-    Build an environment for the llama-server child process. Ensures HOME
-    and TMPDIR are set — the most common cause of SIGABRT when spawning
-    llama-server from Python on macOS.
-    """
     env = os.environ.copy()
     env.setdefault("HOME", os.path.expanduser("~"))
     if not env.get("TMPDIR"):
@@ -722,7 +878,6 @@ def _build_subprocess_env() -> Dict[str, str]:
 
 
 def _strip_quarantine(binary_path: str) -> None:
-    """Remove macOS quarantine xattr if present (idempotent)."""
     if platform.system() != "Darwin":
         return
     try:
@@ -759,8 +914,7 @@ def start_or_restart_server(
         chosen = resolve_startup_model(model_dir, None)
 
     if chosen is None:
-        print(f"[SERVER] No .gguf models found in '{get_models_dir(model_dir)}' — nothing to launch. "
-              f"Set --model-dir or MODEL_DIR to point at your models folder.")
+        print(f"[SERVER] No .gguf models found in '{get_models_dir(model_dir)}' — nothing to launch.")
         CURRENT_SERVER_PROCESS = None
         CURRENT_MODEL_FILENAME = None
         return
@@ -866,23 +1020,31 @@ def start_or_restart_server(
         )
         reader_thread.start()
 
-        remote_nodes = len([e for e in split_info["rpc_string"].split(",") if e]) if split_info["rpc_string"] else 0
-        remote_estimate_bytes = float(chosen["size_gb"]) * (1024 ** 3) * 0.5 if remote_nodes > 0 else 0.0
-
+        planned_targets = _build_planned_targets(split_info, float(chosen["size_gb"]))
+        remote_nodes = len(planned_targets)
         watcher = threading.Thread(
             target=_watch_load,
-            args=(CURRENT_SERVER_PROCESS, gen, monitor, chosen, remote_estimate_bytes, remote_nodes),
+            args=(
+                CURRENT_SERVER_PROCESS,
+                gen,
+                monitor,
+                chosen,
+                planned_targets,
+                remote_nodes,
+                time.time(),
+            ),
             daemon=True,
         )
         watcher.start()
 
+        planned_total = sum(t["planned_gb"] for t in planned_targets.values())
         print(f"[SERVER] Launched '{chosen['name']}' ({chosen['filename']}) using '{llama_server_bin}'. "
               f"PID {CURRENT_SERVER_PROCESS.pid} | tensor-split {split_info['tensor_split']} | "
-              f"usable RAM {usable_gb}GB")
+              f"usable RAM {usable_gb}GB | planned network transfer {planned_total:.2f}GB "
+              f"across {remote_nodes} worker(s)")
 
 
 def stop_server():
-    """Terminates the currently running llama-server process, if any."""
     global CURRENT_SERVER_PROCESS, CURRENT_MODEL_FILENAME
     with _LAUNCH_LOCK:
         if CURRENT_SERVER_PROCESS is not None:

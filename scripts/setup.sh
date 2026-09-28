@@ -14,7 +14,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_DIR="${REPO_ROOT}/bin"
 MODELS_DIR="${REPO_ROOT}/models"
-VENV_DIR="${REPO_ROOT}/myvenv"
+VENV_DIR="${REPO_ROOT}/.venv"
 
 LLAMA_REPO="ggml-org/llama.cpp"
 GITHUB_API="https://api.github.com/repos/${LLAMA_REPO}/releases"
@@ -92,31 +92,129 @@ if [[ "$PY_MAJOR" -lt 3 ]] || [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 10 ]]; the
 fi
 ok "Python $PY_VER at $(command -v $PY)"
 
-# ---------- Fetch latest release tag (bNNNNN) ----------
-# /releases/latest returns the most recent *stable* release (vX.Y.Z),
-# which may not include the newest binaries. /releases?per_page=1 returns
-# the newest entry regardless of pre-release status, which is what we want
-# since llama.cpp ships rolling bNNNNN builds.
-say "Resolving latest llama.cpp release…"
-RELEASE_JSON=$(curl -sL "${GITHUB_API}?per_page=1")
-TAG=$(echo "$RELEASE_JSON" | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+# ---------- Resolve a usable release tag ----------
+# llama.cpp publishes rolling bNNNNN pre-releases. Older ones can be
+# unpublished or marked as drafts, in which case their assets 404.
+# We walk the recent releases and pick the newest one that:
+#   - has at least one downloadable asset
+#   - has an asset matching our selected platform/variant
+# This avoids the "404 Not Found" that happens when ?per_page=1 points
+# at a tag whose assets aren't published yet.
+say "Resolving llama.cpp release…"
 
-if [[ -z "$TAG" ]]; then
-  TAG=$(curl -sL "${GITHUB_API}/latest" | grep -o '"tag_name": *"[^"]*"' | head -n1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
-fi
+RELEASES_JSON=$(curl -sL "${GITHUB_API}?per_page=20")
+[[ -n "$RELEASES_JSON" ]] || die "Could not reach GitHub API."
 
-[[ -n "$TAG" ]] || die "Could not resolve latest release tag from GitHub."
-ok "Latest release: $TAG"
-
-# ---------- Build asset name ----------
+# Build the asset name pattern list for this machine.
+# Each pattern uses a glob that gets matched against the asset names
+# in the release JSON.
 if [[ "$PLATFORM" == "macos" ]]; then
-  ASSET="llama-${TAG}-bin-macos-${ARCH_TAG}.tar.gz"
+  PATTERNS=(
+    "llama-*-bin-macos-${ARCH_TAG}.tar.gz"
+    "llama-*-bin-macos-${ARCH_TAG}.zip"
+  )
 elif [[ "$GPU_TAG" == cuda-* && "$ARCH_TAG" == "x64" ]]; then
-  ASSET="llama-${TAG}-bin-ubuntu-${GPU_TAG}-${ARCH_TAG}.tar.gz"
+  PATTERNS=(
+    "llama-*-bin-ubuntu-${GPU_TAG}-${ARCH_TAG}.tar.gz"
+    "llama-*-bin-ubuntu-${GPU_TAG}-${ARCH_TAG}.zip"
+    "llama-*-bin-ubuntu-cuda-${ARCH_TAG}.tar.gz"
+    "llama-*-bin-ubuntu-cuda-${ARCH_TAG}.zip"
+  )
 else
-  ASSET="llama-${TAG}-bin-ubuntu-${ARCH_TAG}.tar.gz"
+  PATTERNS=(
+    "llama-*-bin-ubuntu-${ARCH_TAG}.tar.gz"
+    "llama-*-bin-ubuntu-${ARCH_TAG}.zip"
+  )
 fi
 
+# Walk releases in order, find the first one whose assets match.
+TAG=""
+ASSET=""
+RELEASE_IDX=0
+while [[ $RELEASE_IDX -lt 20 ]]; do
+  # Extract this release's tag_name
+  CAND_TAG=$(echo "$RELEASES_JSON" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    idx = $RELEASE_IDX
+    if idx < len(data):
+        print(data[idx].get('tag_name',''))
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+
+  [[ -n "$CAND_TAG" ]] || break
+
+  # Extract this release's asset names, one per line
+  CAND_ASSETS=$(echo "$RELEASES_JSON" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    idx = $RELEASE_IDX
+    if idx < len(data):
+        for a in data[idx].get('assets', []):
+            print(a.get('name',''))
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+
+  # Skip releases with no assets at all (drafts, empty)
+  if [[ -z "$CAND_ASSETS" ]]; then
+    RELEASE_IDX=$((RELEASE_IDX + 1))
+    continue
+  fi
+
+  # Try each pattern against the asset list
+  for PATTERN in "${PATTERNS[@]}"; do
+    MATCH=$(echo "$CAND_ASSETS" | grep -F -x "$(echo "$PATTERN" | sed 's/\*/.*/g' | sed 's/\?/./g' | sed 's/^/^/;s/$/$/')" 2>/dev/null | head -n1 || true)
+    # Fallback: use shell globbing against the asset list
+    if [[ -z "$MATCH" ]]; then
+      while IFS= read -r ASSET_NAME; do
+        # shellcheck disable=SC2053
+        if [[ "$ASSET_NAME" == $PATTERN ]]; then
+          MATCH="$ASSET_NAME"
+          break
+        fi
+      done <<<"$CAND_ASSETS"
+    fi
+
+    if [[ -n "$MATCH" ]]; then
+      TAG="$CAND_TAG"
+      ASSET="$MATCH"
+      break
+    fi
+  done
+
+  [[ -n "$TAG" ]] && break
+  RELEASE_IDX=$((RELEASE_IDX + 1))
+done
+
+if [[ -z "$TAG" || -z "$ASSET" ]]; then
+  warn "No prebuilt asset found in the last 20 releases for ${PLATFORM}/${ARCH_TAG}."
+  warn "Falling back to the newest release with any asset."
+  TAG=$(echo "$RELEASES_JSON" | python3 -c "
+import json, sys
+try:
+    data = json.load(sys.stdin)
+    for r in data:
+        if r.get('assets'):
+            print(r['tag_name']); break
+except Exception:
+    pass
+" 2>/dev/null || echo "")
+  [[ -n "$TAG" ]] || die "Could not find any usable release."
+
+  if [[ "$PLATFORM" == "macos" ]]; then
+    ASSET="llama-${TAG}-bin-macos-${ARCH_TAG}.tar.gz"
+  elif [[ "$GPU_TAG" == cuda-* && "$ARCH_TAG" == "x64" ]]; then
+    ASSET="llama-${TAG}-bin-ubuntu-${GPU_TAG}-${ARCH_TAG}.tar.gz"
+  else
+    ASSET="llama-${TAG}-bin-ubuntu-${ARCH_TAG}.tar.gz"
+  fi
+fi
+
+ok "Release: $TAG"
 say "Selected asset: $ASSET"
 
 # ---------- Download and extract ----------
@@ -125,19 +223,36 @@ TMP_FILE="/tmp/${ASSET}"
 
 say "Downloading ${ASSET} …"
 if ! curl -fL --progress-bar -o "$TMP_FILE" "$URL"; then
-  if [[ "$GPU_TAG" == cuda-* ]]; then
-    FALLBACK="llama-${TAG}-bin-ubuntu-cuda-${ARCH_TAG}.tar.gz"
-    warn "CUDA asset not found; trying fallback: ${FALLBACK}"
-    curl -fL --progress-bar -o "$TMP_FILE" "${GITHUB_DL}/${TAG}/${FALLBACK}" ||
-      die "Could not download llama.cpp binaries for ${PLATFORM}/${ARCH_TAG} (${GPU_TAG:-CPU})."
-  else
-    die "Could not download from ${URL}"
-  fi
+  die "Could not download $URL
+
+Check the release page for the exact asset name:
+  https://github.com/${LLAMA_REPO}/releases/tag/${TAG}
+"
 fi
 
 say "Extracting into ${BIN_DIR} …"
 mkdir -p "$BIN_DIR"
-tar -xzf "$TMP_FILE" -C "$BIN_DIR" --strip-components=1
+case "$TMP_FILE" in
+*.zip)
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -oq "$TMP_FILE" -d "$BIN_DIR"
+  else
+    die "unzip is required to extract $TMP_FILE. Install it (apt install unzip / brew install unzip)."
+  fi
+  # Flatten any versioned subdirectory
+  SUBDIR=$(find "$BIN_DIR" -maxdepth 1 -type d -name "llama-*" | head -1)
+  if [[ -n "$SUBDIR" ]]; then
+    mv "$SUBDIR"/* "$BIN_DIR"/ 2>/dev/null || true
+    rmdir "$SUBDIR" 2>/dev/null || true
+  fi
+  ;;
+*.tar.gz)
+  tar -xzf "$TMP_FILE" -C "$BIN_DIR" --strip-components=1
+  ;;
+*)
+  die "Unknown archive format: $TMP_FILE"
+  ;;
+esac
 rm -f "$TMP_FILE"
 
 # ---------- macOS quarantine fix ----------
@@ -160,6 +275,7 @@ if [[ ! -d "$VENV_DIR" ]]; then
   say "Creating virtual environment at ${VENV_DIR}"
   "$PY" -m venv "$VENV_DIR"
 fi
+# shellcheck disable=SC1091
 source "${VENV_DIR}/bin/activate"
 pip install --upgrade pip >/dev/null
 pip install -r "$REQ_FILE"
@@ -195,6 +311,7 @@ ${c_green}${c_bold}Setup complete.${c_reset}
   Models   : ${MODELS_DIR}
   Venv     : ${VENV_DIR}
   Build    : ${PLATFORM}/${ARCH_TAG}${GPU_TAG:+ (${GPU_TAG})}
+  Release  : ${TAG}
 
 You can now run this machine as a host, a worker, or both.
 
@@ -203,5 +320,15 @@ You can now run this machine as a host, a worker, or both.
 
   Start as worker (joins another machine's cluster):
     ./scripts/run-worker.sh --api-url http://<host-ip>:8000
+
+  Launch the desktop GUI client:
+    ./scripts/run-gui.sh
+
+To activate the virtual environment in this shell:
+
+    source .venv/bin/activate
+
+Once activated, your prompt shows '(.venv)' and 'python' resolves
+to the venv interpreter. Run 'deactivate' to leave it.
 
 EOF
