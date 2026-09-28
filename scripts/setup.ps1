@@ -18,17 +18,17 @@ $ErrorActionPreference = "Stop"
 $RepoRoot  = Split-Path -Parent $PSScriptRoot
 $BinDir    = Join-Path $RepoRoot "bin"
 $ModelsDir = Join-Path $RepoRoot "models"
-$VenvDir   = Join-Path $RepoRoot "myvenv"
+$VenvDir   = Join-Path $RepoRoot ".venv"
 
 $LlamaRepo = "ggml-org/llama.cpp"
 $GitHubApi = "https://api.github.com/repos/$LlamaRepo/releases"
 $GitHubDl  = "https://github.com/$LlamaRepo/releases/download"
 
 # ---------- pretty output ----------
-function Say  ($msg) { Write-Host "▸ $msg" -ForegroundColor Yellow }
-function Ok   ($msg) { Write-Host "✓ $msg" -ForegroundColor Green }
+function Say  ($msg) { Write-Host "> $msg" -ForegroundColor Yellow }
+function Ok   ($msg) { Write-Host "+ $msg" -ForegroundColor Green }
 function Warn ($msg) { Write-Host "! $msg" -ForegroundColor Yellow }
-function Die  ($msg) { Write-Host "✗ $msg" -ForegroundColor Red; exit 1 }
+function Die  ($msg) { Write-Host "x $msg" -ForegroundColor Red; exit 1 }
 
 # ---------- Architecture detection ----------
 $ArchTag = if ([Environment]::Is64BitOperatingSystem) {
@@ -41,7 +41,7 @@ $ArchTag = if ([Environment]::Is64BitOperatingSystem) {
 $GpuTag = ""
 $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 if ($nvidiaSmi) {
-  Say "NVIDIA GPU detected, querying driver version…"
+  Say "NVIDIA GPU detected, querying driver version..."
   try {
     $driverVer = (& nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>$null | Select-Object -First 1).Trim()
     if ($driverVer) {
@@ -66,28 +66,35 @@ if ($nvidiaSmi) {
 Say "Detected: windows / $ArchTag $(if ($GpuTag) { "(GPU: $GpuTag)" } else { "" })"
 
 # ---------- Python ----------
-Say "Checking Python…"
+Say "Checking Python..."
 $py = $null
+$ver = $null
 foreach ($cand in @("python", "py")) {
   $cmd = Get-Command $cand -ErrorAction SilentlyContinue
   if ($cmd) {
-    $ver = & $cand -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>$null
-    if ($LASTEXITCODE -eq 0 -and $ver) {
-      $parts = $ver.Split(".")
-      if ([int]$parts[0] -ge 3 -and [int]$parts[1] -ge 10) { $py = $cand; break }
+    $verOutput = & $cand --version 2>&1
+    if ($verOutput -match 'Python (\d+)\.(\d+)') {
+      $majorVer = [int]$Matches[1]
+      $minorVer = [int]$Matches[2]
+      if ($majorVer -ge 3 -and $minorVer -ge 10) {
+        $py = $cand
+        $ver = "$majorVer.$minorVer"
+        break
+      }
     }
   }
 }
 if (-not $py) {
   Die @"
 Python 3.10+ not found. Install from https://www.python.org/downloads/
-Tick "Add python.exe to PATH" during setup.
+Tick "Add python.exe to PATH" and "tcl/tk and IDLE" during setup.
+Then re-run this script.
 "@
 }
 Ok "Python $ver"
 
 # ---------- Fetch latest release tag (bNNNNN) ----------
-Say "Resolving latest llama.cpp release…"
+Say "Resolving latest llama.cpp release..."
 try {
   $releases = Invoke-RestMethod -Uri "$GitHubApi?per_page=1" -UseBasicParsing
   $Tag = $releases[0].tag_name
@@ -114,14 +121,14 @@ New-Item -ItemType Directory -Force -Path $tmpDir | Out-Null
 $url = "$GitHubDl/$Tag/$assetName"
 $zipPath = Join-Path $tmpDir $assetName
 
-Say "Downloading $assetName …"
+Say "Downloading $assetName ..."
 try {
   Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
 } catch {
   Die "Download failed: $_"
 }
 
-Say "Extracting into $BinDir …"
+Say "Extracting into $BinDir ..."
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
 
@@ -135,7 +142,7 @@ if ($extracted) {
 if ($GpuTag) {
   $runtimeUrl = "$GitHubDl/$Tag/$runtimeAssetName"
   $runtimeZip = Join-Path $tmpDir $runtimeAssetName
-  Say "Checking for CUDA runtime DLLs…"
+  Say "Checking for CUDA runtime DLLs..."
   try {
     Invoke-WebRequest -Uri $runtimeUrl -OutFile $runtimeZip -UseBasicParsing -ErrorAction Stop
     Expand-Archive -Path $runtimeZip -DestinationPath $BinDir -Force
@@ -160,7 +167,7 @@ if (Test-Path $rpcExe) {
 }
 
 # ---------- Python deps ----------
-Say "Installing Python dependencies…"
+Say "Installing Python dependencies..."
 $reqPath = Join-Path $RepoRoot "requirements.txt"
 if (-not (Test-Path $reqPath)) { Die "Missing $reqPath" }
 
