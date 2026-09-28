@@ -590,6 +590,7 @@ def calculate_cluster_capacity(active_nodes: dict) -> Dict[str, Any]:
             "available_ram_gb": float(specs.get("available_ram_gb", specs.get("total_ram_gb", 0.0))),
             "usable_ram_gb": usable,
             "excluded": (not is_host) and usable < MIN_USABLE_GB_TO_PARTICIPATE,
+            "cpu_count": int(specs.get("cpu_count", 0)),
         })
 
     return {

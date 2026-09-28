@@ -72,12 +72,6 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\scripts\setup.ps1
 ```
 
-On a worker-only machine (no API host), pass `--worker` on macOS/Linux or `-Worker` on Windows:
-
-```bash
-./scripts/setup.sh --worker
-```
-
 ### 3. Add a model on the host
 
 Drop one or more `.gguf` files into `./models/`. Any GGUF that `llama-server` supports will work. Recommended starters:
@@ -125,7 +119,7 @@ The window has fields for every flag `client.py` accepts:
 
 Click **Connect**. The GUI spawns `client.py` as a subprocess and streams its output into a live log pane on the right side of the window. A green status indicator appears once the worker is registered and heartbeating.
 
-Config is saved to `~/.aiparty_client_gui.json` on every change, so the fields are pre-filled next time you open it. There's also a **Detect** button for the local IP.
+Config is saved to `~/.aiparty_client_gui.json` on every change, so the fields are pre-filled next time you open it.
 
 #### Option B — Command line
 
@@ -140,6 +134,8 @@ Config is saved to `~/.aiparty_client_gui.json` on every change, so the fields a
 ```
 
 Both options launch the same `client.py` process under the hood — the GUI is a form-based wrapper. Whichever you use, the host recalculates the tensor split, restarts `llama-server` with `--rpc` pointing at the new worker, and the model reloads with its layers distributed. The dashboard at `/dashboard` shows every node and its share.
+
+**Important:** `--node-ip` is the address the **API host** uses to reach this worker — not the address the worker uses to reach the host. If you're on Tailscale, use the worker's Tailscale IP. If you're on a LAN, use the worker's LAN IP. Getting this wrong is the most common cause of "the node joined but the model won't load."
 
 ---
 
@@ -179,9 +175,7 @@ Nodes below `MIN_USABLE_GB_TO_PARTICIPATE` (default 0.15 GB) are dropped from th
 3. A background thread reads the pipe line by line and pushes lines into a queue.
 4. The main thread drains the queue every 80 ms and appends to a scrolling text widget.
 
-The GUI doesn't reimplement any cluster logic. It's purely a form + log viewer around the same `client.py` that the CLI wrappers call. If you update `client.py`, the GUI picks up the change automatically.
-
-On Windows the subprocess is spawned with `CREATE_NO_WINDOW` so no console flashes. On macOS and Linux, `os.setsid` puts the child in its own process group so terminating the GUI also terminates `ggml-rpc-server`.
+The GUI doesn't reimplement any cluster logic. It's purely a form + log viewer around the same `client.py` that the CLI wrappers call.
 
 ---
 
