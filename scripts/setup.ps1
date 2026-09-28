@@ -63,7 +63,6 @@ if ($nvidiaSmi) {
   Say "No NVIDIA GPU detected; using CPU build."
 }
 
-# Build the summary line without nested quotes
 $gpuSummary = ""
 if ($GpuTag) { $gpuSummary = " (GPU: $GpuTag)" }
 Say "Detected: windows / $ArchTag$gpuSummary"
@@ -92,27 +91,85 @@ if (-not $py) {
 }
 Ok "Python $ver"
 
-# ---------- Fetch latest release tag (bNNNNN) ----------
-Say "Resolving latest llama.cpp release..."
+# ---------- Resolve a usable release tag ----------
+# llama.cpp publishes rolling bNNNNN pre-releases. Older ones can be
+# unpublished or marked as drafts, in which case their assets 404. We
+# walk the recent releases and pick the newest one that:
+#   - has at least one downloadable asset
+#   - has an asset matching our selected Windows CPU/CUDA variant
+# This avoids the "404 Not Found" that happens when /releases/latest
+# or ?per_page=1 points at a tag whose assets aren't published yet.
+Say "Resolving llama.cpp release..."
+
 try {
-  $releases = Invoke-RestMethod -Uri "$GitHubApi`?per_page=1" -UseBasicParsing
-  $Tag = $releases[0].tag_name
+  $recent = Invoke-RestMethod -Uri "$GitHubApi`?per_page=15" -UseBasicParsing
 } catch {
   Die "Could not reach GitHub API: $_"
 }
-if (-not $Tag) { Die "Could not resolve latest release tag." }
-Ok "Latest release: $Tag"
 
-# ---------- Select asset ----------
-if ($GpuTag) {
-  $assetName = "llama-${Tag}-bin-win-${GpuTag}-${ArchTag}.zip"
-  $runtimeAssetName = "cudart-llama-bin-win-${GpuTag}-${ArchTag}.zip"
-} else {
-  $assetName = "llama-${Tag}-bin-win-cpu-${ArchTag}.zip"
-  $runtimeAssetName = ""
+if (-not $recent -or $recent.Count -eq 0) {
+  Die "No releases returned by GitHub API."
 }
 
+# Build the list of asset name patterns we'll accept for this machine.
+if ($GpuTag) {
+  $assetPatterns = @(
+    "llama-*-bin-win-$GpuTag-$ArchTag.zip"
+  )
+  $runtimePattern = "cudart-llama-bin-win-$GpuTag-$ArchTag.zip"
+} else {
+  $assetPatterns = @(
+    "llama-*-bin-win-cpu-$ArchTag.zip",
+    "llama-*-bin-win-avx2-$ArchTag.zip",
+    "llama-*-bin-win-$ArchTag.zip"
+  )
+  $runtimePattern = $null
+}
+
+$Tag = $null
+$assetName = $null
+$runtimeAssetName = $null
+
+foreach ($rel in $recent) {
+  if (-not $rel.tag_name -or -not $rel.assets) { continue }
+  if ($rel.assets.Count -eq 0) { continue }
+
+  # Prefer releases that actually contain an asset matching our patterns.
+  foreach ($pattern in $assetPatterns) {
+    $match = $rel.assets | Where-Object { $_.name -like $pattern } | Select-Object -First 1
+    if ($match) {
+      $Tag = $rel.tag_name
+      $assetName = $match.name
+      if ($runtimePattern) {
+        $rt = $rel.assets | Where-Object { $_.name -like $runtimePattern } | Select-Object -First 1
+        if ($rt) { $runtimeAssetName = $rt.name }
+      }
+      break
+    }
+  }
+
+  if ($Tag) { break }
+}
+
+if (-not $Tag -or -not $assetName) {
+  Warn "No prebuilt Windows asset found in the last 15 releases."
+  Warn "Falling back to the newest release with any asset, and trying"
+  Warn "the expected filename anyway."
+  $fallback = $recent | Where-Object { $_.assets -and $_.assets.Count -gt 0 } | Select-Object -First 1
+  if (-not $fallback) {
+    Die "No usable llama.cpp release found on GitHub."
+  }
+  $Tag = $fallback.tag_name
+  if ($GpuTag) {
+    $assetName = "llama-$Tag-bin-win-$GpuTag-$ArchTag.zip"
+  } else {
+    $assetName = "llama-$Tag-bin-win-cpu-$ArchTag.zip"
+  }
+}
+
+Ok "Release: $Tag"
 Say "Selected asset: $assetName"
+if ($runtimeAssetName) { Say "CUDA runtime: $runtimeAssetName" }
 
 # ---------- Download and extract ----------
 $tmpDir = Join-Path $env:TEMP "llama-setup-$(Get-Random)"
@@ -125,13 +182,14 @@ Say "Downloading $assetName ..."
 try {
   Invoke-WebRequest -Uri $url -OutFile $zipPath -UseBasicParsing
 } catch {
-  Die "Download failed: $_"
+  Die "Download failed for $url`n$($_.Exception.Message)"
 }
 
 Say "Extracting into $BinDir ..."
 New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
 Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
 
+# Flatten any versioned subdirectory
 $extracted = Get-ChildItem -Path $tmpDir -Directory | Where-Object { $_.Name -like "llama-*" } | Select-Object -First 1
 if ($extracted) {
   Copy-Item -Path (Join-Path $extracted.FullName "*") -Destination $BinDir -Recurse -Force
@@ -139,16 +197,17 @@ if ($extracted) {
   Copy-Item -Path (Join-Path $tmpDir "*") -Destination $BinDir -Recurse -Force
 }
 
-if ($GpuTag -and $runtimeAssetName) {
+# Optional: separate CUDA runtime DLLs
+if ($runtimeAssetName) {
   $runtimeUrl = "$GitHubDl/$Tag/$runtimeAssetName"
   $runtimeZip = Join-Path $tmpDir $runtimeAssetName
-  Say "Checking for CUDA runtime DLLs..."
+  Say "Downloading CUDA runtime DLLs ..."
   try {
     Invoke-WebRequest -Uri $runtimeUrl -OutFile $runtimeZip -UseBasicParsing -ErrorAction Stop
     Expand-Archive -Path $runtimeZip -DestinationPath $BinDir -Force
     Ok "CUDA runtime DLLs installed"
   } catch {
-    Say "No separate CUDA runtime archive for this release."
+    Say "No separate CUDA runtime archive for this release (driver-provided DLLs will be used)."
   }
 }
 
@@ -157,13 +216,13 @@ Remove-Item -Path $tmpDir -Recurse -Force
 # ---------- Verify ----------
 $serverExe = Join-Path $BinDir "llama-server.exe"
 if (-not (Test-Path $serverExe)) {
-  Die "llama-server.exe not found in $BinDir."
+  Die "llama-server.exe not found in $BinDir. Archive may have an unexpected layout."
 }
 $rpcExe = Join-Path $BinDir "ggml-rpc-server.exe"
 if (Test-Path $rpcExe) {
   Ok "Found llama-server.exe and ggml-rpc-server.exe"
 } else {
-  Warn "ggml-rpc-server.exe not found; RPC backend may be missing."
+  Warn "ggml-rpc-server.exe not found; the RPC backend may not be in this build."
 }
 
 # ---------- Python deps ----------
@@ -212,6 +271,7 @@ Write-Host "  Binaries : $BinDir"
 Write-Host "  Models   : $ModelsDir"
 Write-Host "  Venv     : $VenvDir"
 Write-Host "  Build    : windows / $ArchTag$gpuSummary"
+Write-Host "  Release  : $Tag"
 Write-Host ""
 Write-Host "You can now run this machine as a host, a worker, or both."
 Write-Host ""
@@ -221,8 +281,8 @@ Write-Host ""
 Write-Host "  Start as worker (joins another machine's cluster):"
 Write-Host "    .\scripts\run-worker.ps1 -ApiUrl http://<host-ip>:8000"
 Write-Host ""
-Write-Host "  Launch the desktop GUI client: (Once you have activated venv)"
-Write-Host "    python app.py"
+Write-Host "  Launch the desktop GUI client:"
+Write-Host "    .\scripts\run-gui.ps1"
 Write-Host ""
 Write-Host "To activate the virtual environment in this PowerShell window:" -ForegroundColor Cyan
 Write-Host ""
